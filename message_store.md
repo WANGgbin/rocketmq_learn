@@ -28,6 +28,12 @@ rmq 又引入了一个刷盘是否超时的监控线程，会依次便利刷盘�
 
 ## consumeQueue
 
+在一个 broker 中，所有的消息都是写入到 commitLog 中。这样的好处是：写消息很方便。但是读就不好读了，不同 topic + queue 的消息混在一起。
+
+怎么办呢？这就是 consumeQueue 存在的意义。当消息写入到 commitLog 会有后台任务将消息从 commitLog 按照 topic + queue 分发到 consumeQueue
+中。当然，consumeQueue 中存的只是 commitLog 中消息的索引信息，具体来说就是 offset + size。这样对于 consumer 而言，只需要从 consumeQueue
+读取消息即可。
+
 ## indexFile
 
 indexFile 文件的目的是提供根据 key 查找消息的功能。消息可能很多，所以需要多个 indexFile 文件，每个 indexFile
@@ -138,9 +144,26 @@ BatchDispatchRequest 的顺序。
 
     }
 ```
+
+# mappedFile
+
+在 rmq 中，为了实现文件的高效操作，都是通过 mappedFile 的方式进行文件读写的。但是这种方式也有问题，如果发生缺页中断，还是需要从磁盘中加载页
+到内存中，性能还是会有抖动。
+
+rmq 通过下面两种方式来保证页在内存中。
+
 ## 内存预热
 
+当创建了一个新的 mappedFile 时，我们知道磁盘页并没有加载到内存中。等到后面读写文件的时候，就会发生缺页中断。 rmq 在每次创建新的 mappedFile
+时，会进行 **内存预热**，即将磁盘中的页加载到内存中，具体实现方式为：每一个磁盘页(4k) 读取一个字节，这样就会将磁盘页加载到内存中。
+
+同时为了性能考虑，rmq 都是通过提前创建 mappedFile 的方式避免预热操作影响正常的逻辑。
+
 ## 内存锁定
+
+即使将磁盘页加载到内存中，当内存空间紧张的时候，还是有可能被换出的，这样下次访问还是会出现缺页中断问题。
+
+rmq 通过 mlock() 系统调用，会将这些页锁住，这些页就不会被换出。
 
 # 日志清理
 
@@ -188,3 +211,10 @@ commitLog、consumeQueue、indexFile 各自有各自的定时任务来完成持�
 
 这里其实就有一个一致性的问题：比如 commitLog 和 consumeQueue 这两个文件，因为他们的持久化不是一致的，导致最终恢复出来的数据也不是一致的(不在一个 offset)，
 所以还需要调谐：如果 commitLog 恢复的 commitOffset 小于 consumeQueue 恢复的 maxPhyOffset，则需要删除 consumeQueue 中多余的文件。
+
+恢复逻辑的核心思想如下：
+
+- 首先会记录各个需要持久化对象的 checkpoint，这样恢复就不用从头开始，只需要从 checkpoint 开始恢复即可，加快恢复速度。
+- 其次，多个持久化对象之间是不一致的，需要从一个对象出发来构建其他对象。在 rmq 中，所有的恢复都是从 commitLog 开始。
+commitLog 就是一生二、二生三、三生万物中的一。
+
